@@ -155,7 +155,8 @@ def deploy_from_repo(name: str, repo_url: str):
         metadata=client.V1ObjectMeta(name=build_job_name, namespace="default"),
         spec=client.V1JobSpec(
             template=client.V1PodTemplateSpec(spec=pod_spec),
-            backoff_limit=0
+            backoff_limit=0,
+            ttl_seconds_after_finished=300
         )
     )
     # 기존에 같은 이름의 빌드 Job이 있으면 먼저 정리
@@ -176,8 +177,12 @@ def deploy_from_repo(name: str, repo_url: str):
         if job_status.status.succeeded:
             break
         if job_status.status.failed:
-            return {"status": "build failed"}
+            pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
+            logs = "로그를 찾을 수 없음"
+            if pods.items:
+                pod_name = pods.items[0].metadata.name
+                logs = v1.read_namespaced_pod_log(name=pod_name, namespace="default", container="kaniko")
+            return {"status": "build failed", "logs": logs}
         time.sleep(3)
-
     # 빌드 끝났으니 기존 배포 로직 재사용
     return create_deployment(name=name, image=image)
