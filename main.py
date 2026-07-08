@@ -5,6 +5,8 @@ import time
 
 app = FastAPI()
 
+PUBLIC_HOST = "10.0.0.160"  # TODO: Public IP 승인되면 그 IP로 교체
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,7 +104,7 @@ def create_deployment(name: str, image: str):
         "namespace": namespace,
         "deployment": name,
         "status": "created",
-        "url": f"http://{name}.gsmsv.local:30707"
+        "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:30707"
     }
 
 
@@ -212,7 +214,7 @@ def deploy_from_repo_status(name: str):
             "namespace": namespace,
             "deployment": name,
             "status": "created",
-            "url": f"http://{name}.gsmsv.local:30707"
+            "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:30707"
         }
     except client.exceptions.ApiException:
         return create_deployment(name=name, image=image)
