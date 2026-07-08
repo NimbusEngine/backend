@@ -4,6 +4,9 @@ from kubernetes import client, config
 import time
 import sqlite3
 import requests
+import pymysql
+import bcrypt
+import secrets
 from datetime import datetime, timezone
 
 app = FastAPI()
@@ -11,13 +14,8 @@ app = FastAPI()
 PUBLIC_HOST = "158.247.251.109"
 PUBLIC_PORT = 26117
 DOCKER_HUB_USER = "whdudwo1127"
-API_KEY = "nimbus_sk_8f3c91e7b2d4a6f0"
 
-
-def verify_api_key(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-
+MYSQL_PASSWORD = "whdudwo1127"
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +31,8 @@ apps_v1 = client.AppsV1Api()
 batch_v1 = client.BatchV1Api()
 networking_v1 = client.NetworkingV1Api()
 
+
+# ---------- SQLite (배포 기록 로그, 기존 그대로) ----------
 
 DB_PATH = "/home/ubuntu/backend/history.db"
 
@@ -65,6 +65,114 @@ def log_history(name, source, status, detail=""):
 
 init_db()
 
+
+# ---------- MySQL (사용자 계정, 배포 소유권) ----------
+
+def get_db():
+    return pymysql.connect(
+        host="localhost",
+        user="nimbus",
+        password=MYSQL_PASSWORD,
+        database="nimbusengine",
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
+
+
+def generate_api_key() -> str:
+    return "nimbus_" + secrets.token_hex(16)
+
+
+def get_current_user(x_api_key: str = Header(None)) -> str:
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API 키가 필요합니다")
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username FROM users WHERE api_key=%s", (x_api_key,))
+            user = cur.fetchone()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+        return user["username"]
+    finally:
+        conn.close()
+
+
+@app.post("/auth/register")
+def register(username: str, password: str):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE username=%s", (username,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="이미 존재하는 아이디입니다")
+            api_key = generate_api_key()
+            cur.execute(
+                "INSERT INTO users (username, password_hash, api_key) VALUES (%s, %s, %s)",
+                (username, hash_password(password), api_key)
+            )
+        conn.commit()
+        return {"username": username, "api_key": api_key}
+    finally:
+        conn.close()
+
+
+@app.post("/auth/login")
+def login(username: str, password: str):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+            user = cur.fetchone()
+        if not user or not verify_password(password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 틀렸습니다")
+        return {"username": username, "api_key": user["api_key"]}
+    finally:
+        conn.close()
+
+
+def record_ownership(name, owner, source, detail):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "REPLACE INTO deployments (name, owner, source, detail) VALUES (%s, %s, %s, %s)",
+                (name, owner, source, detail)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_owner(name):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT owner FROM deployments WHERE name=%s", (name,))
+            row = cur.fetchone()
+        return row["owner"] if row else None
+    finally:
+        conn.close()
+
+
+def remove_ownership(name):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM deployments WHERE name=%s", (name,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- GitHub 저장소 자동 감지 ----------
 
 def parse_repo_url(repo_url):
     path = repo_url.replace("https://github.com/", "").replace(".git", "").strip("/")
@@ -119,8 +227,8 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.post("/deployments", dependencies=[Depends(verify_api_key)])
-def create_deployment(name: str, image: str, source: str = "image"):
+@app.post("/deployments")
+def create_deployment(name: str, image: str, source: str = "image", username: str = Depends(get_current_user)):
     namespace = f"user-{name}"
 
     # 1. 네임스페이스 생성
@@ -192,6 +300,7 @@ def create_deployment(name: str, image: str, source: str = "image"):
     )
     networking_v1.create_namespaced_ingress(namespace=namespace, body=ingress_body)
 
+    record_ownership(name, username, source, image)
     log_history(name, source, "created", image)
 
     return {
@@ -216,16 +325,21 @@ def get_deployment(name: str):
         return {"error": "not found"}
 
 
-@app.delete("/deployments/{name}", dependencies=[Depends(verify_api_key)])
-def delete_deployment(name: str):
+@app.delete("/deployments/{name}")
+def delete_deployment(name: str, username: str = Depends(get_current_user)):
+    owner = get_owner(name)
+    if owner and owner != username:
+        raise HTTPException(status_code=403, detail="본인이 만든 배포만 삭제할 수 있습니다")
+
     namespace = f"user-{name}"
     v1.delete_namespace(name=namespace)
+    remove_ownership(name)
     log_history(name, "unknown", "deleted")
     return {"namespace": namespace, "status": "deleted"}
 
 
-@app.post("/deploy-from-repo", dependencies=[Depends(verify_api_key)])
-def deploy_from_repo(name: str, repo_url: str):
+@app.post("/deploy-from-repo")
+def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_current_user)):
     image = f"{DOCKER_HUB_USER}/{name}:latest"
     build_job_name = f"kaniko-build-{name}"
     configmap_name = f"dockerfile-{name}"
@@ -260,7 +374,6 @@ def deploy_from_repo(name: str, repo_url: str):
     docker_config_mount = client.V1VolumeMount(name="docker-config", mount_path="/kaniko/.docker")
 
     if has_dockerfile:
-        # 저장소에 Dockerfile이 이미 있으면 -> 기존 방식(git context) 그대로
         kaniko_container = client.V1Container(
             name="kaniko",
             image="gcr.io/kaniko-project/executor:latest",
@@ -276,7 +389,6 @@ def deploy_from_repo(name: str, repo_url: str):
             volumes=[docker_config_volume]
         )
     else:
-        # Dockerfile이 없으면 -> 파일 목록 보고 자동 생성
         dockerfile_content = generate_dockerfile(files)
         if dockerfile_content is None:
             log_history(name, "repo", "build_failed", "Dockerfile 없음, 자동 감지 실패")
@@ -329,7 +441,11 @@ def deploy_from_repo(name: str, repo_url: str):
         )
 
     job_body = client.V1Job(
-        metadata=client.V1ObjectMeta(name=build_job_name, namespace="default"),
+        metadata=client.V1ObjectMeta(
+            name=build_job_name,
+            namespace="default",
+            annotations={"nimbus.io/owner": username}
+        ),
         spec=client.V1JobSpec(
             template=client.V1PodTemplateSpec(spec=pod_spec),
             backoff_limit=0,
@@ -347,11 +463,14 @@ def deploy_from_repo_status(name: str):
     build_job_name = f"kaniko-build-{name}"
 
     try:
-        job_status = batch_v1.read_namespaced_job_status(name=build_job_name, namespace="default")
+        job = batch_v1.read_namespaced_job(name=build_job_name, namespace="default")
     except client.exceptions.ApiException:
         return {"status": "not found"}
 
-    if job_status.status.failed:
+    job_status = job.status
+    owner = (job.metadata.annotations or {}).get("nimbus.io/owner", "unknown")
+
+    if job_status.failed:
         pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
         logs = "로그를 찾을 수 없음"
         if pods.items:
@@ -365,7 +484,7 @@ def deploy_from_repo_status(name: str):
         log_history(name, "repo", "build_failed", logs[:300])
         return {"status": "build failed", "logs": logs}
 
-    if not job_status.status.succeeded:
+    if not job_status.succeeded:
         return {"status": "building"}
 
     # 빌드 성공 -> 이미 배포됐는지 확인 후, 없으면 새로 배포
@@ -379,7 +498,7 @@ def deploy_from_repo_status(name: str):
             "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:{PUBLIC_PORT}"
         }
     except client.exceptions.ApiException:
-        return create_deployment(name=name, image=image, source="repo")
+        return create_deployment(name=name, image=image, source="repo", username=owner)
 
 
 @app.get("/history")
