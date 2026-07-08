@@ -79,7 +79,7 @@ def create_deployment(name: str, image: str):
             ingress_class_name="nginx",
             rules=[
                 client.V1IngressRule(
-                    host=f"{name}.gsmsv.local",
+                    host=f"{name}.{PUBLIC_HOST}.sslip.io",
                     http=client.V1HTTPIngressRuleValue(
                         paths=[
                             client.V1HTTPIngressPath(
