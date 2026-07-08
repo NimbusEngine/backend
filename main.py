@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client, config
 import time
@@ -11,6 +11,13 @@ app = FastAPI()
 PUBLIC_HOST = "158.247.251.109"
 PUBLIC_PORT = 26117
 DOCKER_HUB_USER = "whdudwo1127"
+API_KEY = "nimbus_sk_8f3c91e7b2d4a6f0"
+
+
+def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -112,7 +119,7 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.post("/deployments")
+@app.post("/deployments", dependencies=[Depends(verify_api_key)])
 def create_deployment(name: str, image: str, source: str = "image"):
     namespace = f"user-{name}"
 
@@ -209,7 +216,7 @@ def get_deployment(name: str):
         return {"error": "not found"}
 
 
-@app.delete("/deployments/{name}")
+@app.delete("/deployments/{name}", dependencies=[Depends(verify_api_key)])
 def delete_deployment(name: str):
     namespace = f"user-{name}"
     v1.delete_namespace(name=namespace)
@@ -217,7 +224,7 @@ def delete_deployment(name: str):
     return {"namespace": namespace, "status": "deleted"}
 
 
-@app.post("/deploy-from-repo")
+@app.post("/deploy-from-repo", dependencies=[Depends(verify_api_key)])
 def deploy_from_repo(name: str, repo_url: str):
     image = f"{DOCKER_HUB_USER}/{name}:latest"
     build_job_name = f"kaniko-build-{name}"
@@ -382,4 +389,3 @@ def get_history():
     rows = conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
