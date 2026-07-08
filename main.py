@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client, config
+import time
 
 app = FastAPI()
 
@@ -15,6 +16,7 @@ app.add_middleware(
 config.load_kube_config()
 v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
+batch_v1 = client.BatchV1Api()
 networking_v1 = client.NetworkingV1Api()
 
 
@@ -118,3 +120,54 @@ def delete_deployment(name: str):
     namespace = f"user-{name}"
     v1.delete_namespace(name=namespace)
     return {"namespace": namespace, "status": "deleted"}
+
+@app.post("/deploy-from-repo")
+def deploy_from_repo(name: str, repo_url: str):
+    docker_hub_user = "whdudwo1127"
+    image = f"{docker_hub_user}/{name}:latest"
+    build_job_name = f"kaniko-build-{name}"
+
+    container = client.V1Container(
+        name="kaniko",
+        image="gcr.io/kaniko-project/executor:latest",
+        args=[
+            f"--context=git://{repo_url.replace('https://', '')}",
+            f"--destination={image}",
+        ],
+        volume_mounts=[
+            client.V1VolumeMount(name="docker-config", mount_path="/kaniko/.docker")
+        ]
+    )
+    pod_spec = client.V1PodSpec(
+        containers=[container],
+        restart_policy="Never",
+        volumes=[
+            client.V1Volume(
+                name="docker-config",
+                secret=client.V1SecretVolumeSource(
+                    secret_name="dockerhub-secret",
+                    items=[client.V1KeyToPath(key=".dockerconfigjson", path="config.json")]
+                )
+            )
+        ]
+    )
+    job_body = client.V1Job(
+        metadata=client.V1ObjectMeta(name=build_job_name, namespace="default"),
+        spec=client.V1JobSpec(
+            template=client.V1PodTemplateSpec(spec=pod_spec),
+            backoff_limit=0
+        )
+    )
+    batch_v1.create_namespaced_job(namespace="default", body=job_body)
+
+    # 빌드가 끝날 때까지 대기
+    while True:
+        job_status = batch_v1.read_namespaced_job_status(name=build_job_name, namespace="default")
+        if job_status.status.succeeded:
+            break
+        if job_status.status.failed:
+            return {"status": "build failed"}
+        time.sleep(3)
+
+    # 빌드 끝났으니 기존 배포 로직 재사용
+    return create_deployment(name=name, image=image)
