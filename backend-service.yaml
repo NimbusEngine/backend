@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-backend
+  namespace: console
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: nimbus-backend
+  namespace: console
+subsets:
+- addresses:
+  - ip: 10.0.0.160
+  ports:
+  - port: 8000
