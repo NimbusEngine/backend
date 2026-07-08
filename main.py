@@ -98,7 +98,12 @@ def create_deployment(name: str, image: str):
     )
     networking_v1.create_namespaced_ingress(namespace=namespace, body=ingress_body)
 
-    return {"namespace": namespace, "deployment": name, "status": "created"}
+    return {
+        "namespace": namespace,
+        "deployment": name,
+        "status": "created",
+        "url": f"http://{name}.gsmsv.local:30707"
+    }
 
 
 @app.get("/deployments/{name}")
@@ -120,6 +125,7 @@ def delete_deployment(name: str):
     namespace = f"user-{name}"
     v1.delete_namespace(name=namespace)
     return {"namespace": namespace, "status": "deleted"}
+
 
 @app.post("/deploy-from-repo")
 def deploy_from_repo(name: str, repo_url: str):
@@ -159,6 +165,7 @@ def deploy_from_repo(name: str, repo_url: str):
             ttl_seconds_after_finished=300
         )
     )
+
     # 기존에 같은 이름의 빌드 Job이 있으면 먼저 정리
     try:
         batch_v1.delete_namespaced_job(
@@ -169,20 +176,43 @@ def deploy_from_repo(name: str, repo_url: str):
         time.sleep(3)  # 삭제 완료될 시간 확보
     except client.exceptions.ApiException:
         pass  # 원래 없었으면 그냥 넘어감
+
     batch_v1.create_namespaced_job(namespace="default", body=job_body)
 
-    # 빌드가 끝날 때까지 대기
-    while True:
+    return {"status": "building", "name": name}
+
+
+@app.get("/deploy-from-repo/{name}/status")
+def deploy_from_repo_status(name: str):
+    docker_hub_user = "whdudwo1127"
+    image = f"{docker_hub_user}/{name}:latest"
+    build_job_name = f"kaniko-build-{name}"
+
+    try:
         job_status = batch_v1.read_namespaced_job_status(name=build_job_name, namespace="default")
-        if job_status.status.succeeded:
-            break
-        if job_status.status.failed:
-            pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
-            logs = "로그를 찾을 수 없음"
-            if pods.items:
-                pod_name = pods.items[0].metadata.name
-                logs = v1.read_namespaced_pod_log(name=pod_name, namespace="default", container="kaniko")
-            return {"status": "build failed", "logs": logs}
-        time.sleep(3)
-    # 빌드 끝났으니 기존 배포 로직 재사용
-    return create_deployment(name=name, image=image)
+    except client.exceptions.ApiException:
+        return {"status": "not found"}
+
+    if job_status.status.failed:
+        pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
+        logs = "로그를 찾을 수 없음"
+        if pods.items:
+            pod_name = pods.items[0].metadata.name
+            logs = v1.read_namespaced_pod_log(name=pod_name, namespace="default", container="kaniko")
+        return {"status": "build failed", "logs": logs}
+
+    if not job_status.status.succeeded:
+        return {"status": "building"}
+
+    # 빌드 성공 -> 이미 배포됐는지 확인 후, 없으면 새로 배포
+    namespace = f"user-{name}"
+    try:
+        apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+        return {
+            "namespace": namespace,
+            "deployment": name,
+            "status": "created",
+            "url": f"http://{name}.gsmsv.local:30707"
+        }
+    except client.exceptions.ApiException:
+        return create_deployment(name=name, image=image)
