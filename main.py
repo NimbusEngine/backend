@@ -158,6 +158,16 @@ def deploy_from_repo(name: str, repo_url: str):
             backoff_limit=0
         )
     )
+    # 기존에 같은 이름의 빌드 Job이 있으면 먼저 정리
+    try:
+        batch_v1.delete_namespaced_job(
+            name=build_job_name,
+            namespace="default",
+            propagation_policy="Foreground"
+        )
+        time.sleep(3)  # 삭제 완료될 시간 확보
+    except client.exceptions.ApiException:
+        pass  # 원래 없었으면 그냥 넘어감
     batch_v1.create_namespaced_job(namespace="default", body=job_body)
 
     # 빌드가 끝날 때까지 대기
