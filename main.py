@@ -7,6 +7,7 @@ import requests
 import pymysql
 import bcrypt
 import secrets
+import re
 from datetime import datetime, timezone
 
 app = FastAPI()
@@ -88,6 +89,14 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def generate_api_key() -> str:
     return "nimbus_" + secrets.token_hex(16)
+
+
+def validate_name(name: str):
+    if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', name):
+        raise HTTPException(
+            status_code=400,
+            detail="프로젝트 이름은 소문자/숫자/하이픈(-)만 사용 가능하고, 문자나 숫자로 시작·끝나야 합니다. (예: my-app)"
+        )
 
 
 def get_current_user(x_api_key: str = Header(None)) -> str:
@@ -229,6 +238,7 @@ def health_check():
 
 @app.post("/deployments")
 def create_deployment(name: str, image: str, source: str = "image", username: str = Depends(get_current_user)):
+    validate_name(name)
     namespace = f"user-{name}"
 
     # 1. 네임스페이스 생성
@@ -340,6 +350,7 @@ def delete_deployment(name: str, username: str = Depends(get_current_user)):
 
 @app.post("/deploy-from-repo")
 def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_current_user)):
+    validate_name(name)
     image = f"{DOCKER_HUB_USER}/{name}:latest"
     build_job_name = f"kaniko-build-{name}"
     configmap_name = f"dockerfile-{name}"
