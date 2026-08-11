@@ -322,11 +322,33 @@ def ensure_namespace(namespace: str):
         ))
 
 
-def apply_deployment(namespace, name, image, port):
+def parse_env(env: str):
+    """"KEY=VALUE,KEY2=VALUE2" 형식의 문자열을 환경변수 목록으로 바꾼다.
+
+    값에 '='가 들어가도 되도록 첫 번째 '='에서만 나눈다.
+    값에 쉼표는 쓸 수 없다.
+    """
+    if not env:
+        return []
+
+    env_vars = []
+    for pair in env.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if key:
+            env_vars.append(client.V1EnvVar(name=key, value=value.strip()))
+    return env_vars
+
+
+def apply_deployment(namespace, name, image, port, env_vars=None):
     container = client.V1Container(
         name=name,
         image=image,
-        ports=[client.V1ContainerPort(container_port=port)]
+        ports=[client.V1ContainerPort(container_port=port)],
+        env=env_vars or None
     )
     body = client.V1Deployment(
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
@@ -404,7 +426,7 @@ def apply_ingress(namespace, project, service_name):
 
 
 def deploy_component(project, name, image, port=DEFAULT_PORT, service_name=None,
-                     expose=True, source="image", username="unknown"):
+                     expose=True, source="image", username="unknown", env=None):
     validate_name(project)
     validate_name(name)
 
@@ -413,7 +435,7 @@ def deploy_component(project, name, image, port=DEFAULT_PORT, service_name=None,
     validate_name(service_name)
 
     ensure_namespace(namespace)
-    apply_deployment(namespace, name, image, port)
+    apply_deployment(namespace, name, image, port, parse_env(env))
     apply_service(namespace, service_name, name, port)
     if expose:
         apply_ingress(namespace, project, service_name)
@@ -435,11 +457,17 @@ def deploy_component(project, name, image, port=DEFAULT_PORT, service_name=None,
 
 @app.post("/deployments")
 def create_deployment(name: str, image: str, source: str = "image", port: int = DEFAULT_PORT,
-                      username: str = Depends(get_current_user)):
-    """이미지 하나를 그대로 배포한다. 프로젝트 이름과 컴포넌트 이름이 같은 단일 구성."""
+                      project: str = None, service_name: str = None, expose: bool = True,
+                      env: str = None, username: str = Depends(get_current_user)):
+    """이미지를 그대로 배포한다.
+
+    project를 생략하면 name과 같은 이름의 단일 컴포넌트 프로젝트가 된다.
+    DB처럼 빌드가 필요 없는 컴포넌트를 프로젝트에 추가할 때 사용한다.
+    """
     return deploy_component(
-        project=name, name=name, image=image, port=port,
-        service_name=name, expose=True, source=source, username=username
+        project=project or name, name=name, image=image, port=port,
+        service_name=service_name or name, expose=expose,
+        source=source, username=username, env=env
     )
 
 
@@ -517,6 +545,7 @@ def deploy_from_repo(
     project: str = None,
     service_name: str = None,
     expose: bool = True,
+    env: str = None,
     username: str = Depends(get_current_user),
 ):
     """저장소를 빌드해 컴포넌트로 배포한다.
@@ -646,6 +675,7 @@ def deploy_from_repo(
                 "nimbus.io/component": name,
                 "nimbus.io/service": service_name,
                 "nimbus.io/expose": str(expose).lower(),
+                "nimbus.io/env": env or "",
             }
         ),
         spec=client.V1JobSpec(
@@ -684,6 +714,7 @@ def deploy_from_repo_status(name: str, project: str = None):
     component = annotations.get("nimbus.io/component", name)
     service_name = annotations.get("nimbus.io/service", component)
     expose = annotations.get("nimbus.io/expose", "true") == "true"
+    env = annotations.get("nimbus.io/env") or None
 
     image = f"{DOCKER_HUB_USER}/{component_slug(project, component)}:latest"
 
@@ -718,7 +749,8 @@ def deploy_from_repo_status(name: str, project: str = None):
     except client.exceptions.ApiException:
         return deploy_component(
             project=project, name=component, image=image, port=app_port,
-            service_name=service_name, expose=expose, source="repo", username=owner
+            service_name=service_name, expose=expose, source="repo",
+            username=owner, env=env
         )
 
 
