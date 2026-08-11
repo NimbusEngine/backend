@@ -284,52 +284,91 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.post("/deployments")
-def create_deployment(name: str, image: str, source: str = "image", port: int = DEFAULT_PORT, username: str = Depends(get_current_user)):
-    validate_name(name)
-    namespace = f"user-{name}"
+# ---------- 프로젝트 / 컴포넌트 배포 ----------
+#
+# 배포 단위는 "프로젝트"이고, 프로젝트 하나가 네임스페이스 하나(user-<project>)에 대응한다.
+# 프로젝트 안에는 컴포넌트를 여러 개 둘 수 있으며, 같은 네임스페이스에 있으므로
+# 컴포넌트끼리 Service 이름으로 서로를 호출할 수 있다.
+#   예) 프론트엔드에서 http://<service_name> 으로 백엔드 호출
+#
+# 외부 노출은 expose=True 인 컴포넌트에만 Ingress를 만들어 처리한다.
 
-    # 1. 네임스페이스 생성
-    ns_body = client.V1Namespace(
-        metadata=client.V1ObjectMeta(name=namespace)
-    )
-    v1.create_namespace(body=ns_body)
 
-    # 2. Deployment 생성
+def project_namespace(project: str) -> str:
+    return f"user-{project}"
+
+
+def project_url(project: str) -> str:
+    return f"http://{project}.{PUBLIC_HOST}.sslip.io:{PUBLIC_PORT}"
+
+
+def component_slug(project: str, component: str) -> str:
+    """이미지 태그와 빌드 Job 이름에 쓰는 식별자.
+
+    단일 컴포넌트 프로젝트에서 이름이 중복되지 않도록(taskflow-taskflow) 구분한다.
+    """
+    return component if project == component else f"{project}-{component}"
+
+
+def ensure_namespace(namespace: str):
+    """네임스페이스가 없으면 만들고, 이미 있으면 그대로 사용한다."""
+    try:
+        v1.read_namespace(name=namespace)
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+        v1.create_namespace(body=client.V1Namespace(
+            metadata=client.V1ObjectMeta(name=namespace)
+        ))
+
+
+def apply_deployment(namespace, name, image, port):
     container = client.V1Container(
         name=name,
         image=image,
         ports=[client.V1ContainerPort(container_port=port)]
     )
-    template = client.V1PodTemplateSpec(
-        metadata=client.V1ObjectMeta(labels={"app": name}),
-        spec=client.V1PodSpec(containers=[container])
-    )
-    spec = client.V1DeploymentSpec(
-        replicas=1,
-        selector=client.V1LabelSelector(match_labels={"app": name}),
-        template=template
-    )
-    deployment_body = client.V1Deployment(
+    body = client.V1Deployment(
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
-        spec=spec
+        spec=client.V1DeploymentSpec(
+            replicas=1,
+            selector=client.V1LabelSelector(match_labels={"app": name}),
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(labels={"app": name}),
+                spec=client.V1PodSpec(containers=[container])
+            )
+        )
     )
-    apps_v1.create_namespaced_deployment(namespace=namespace, body=deployment_body)
+    try:
+        apps_v1.create_namespaced_deployment(namespace=namespace, body=body)
+    except client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+        apps_v1.replace_namespaced_deployment(name=name, namespace=namespace, body=body)
 
-    # 3. Service 생성
-    service_body = client.V1Service(
-        metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+
+def apply_service(namespace, service_name, app_label, port):
+    body = client.V1Service(
+        metadata=client.V1ObjectMeta(name=service_name, namespace=namespace),
         spec=client.V1ServiceSpec(
-            selector={"app": name},
+            selector={"app": app_label},
             ports=[client.V1ServicePort(port=80, target_port=port)]
         )
     )
-    v1.create_namespaced_service(namespace=namespace, body=service_body)
+    try:
+        v1.create_namespaced_service(namespace=namespace, body=body)
+    except client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+        # Service는 clusterIP가 불변이라 교체 대신 spec만 갱신한다
+        v1.patch_namespaced_service(name=service_name, namespace=namespace, body=body)
 
-    # 4. Ingress 생성
-    ingress_body = client.V1Ingress(
+
+def apply_ingress(namespace, project, service_name):
+    """프로젝트의 진입점 Ingress. 호스트는 프로젝트 이름 하나로 고정한다."""
+    body = client.V1Ingress(
         metadata=client.V1ObjectMeta(
-            name=name,
+            name=project,
             namespace=namespace,
             annotations={"nginx.ingress.kubernetes.io/rewrite-target": "/"}
         ),
@@ -337,7 +376,7 @@ def create_deployment(name: str, image: str, source: str = "image", port: int = 
             ingress_class_name="nginx",
             rules=[
                 client.V1IngressRule(
-                    host=f"{name}.{PUBLIC_HOST}.sslip.io",
+                    host=f"{project}.{PUBLIC_HOST}.sslip.io",
                     http=client.V1HTTPIngressRuleValue(
                         paths=[
                             client.V1HTTPIngressPath(
@@ -345,7 +384,7 @@ def create_deployment(name: str, image: str, source: str = "image", port: int = 
                                 path_type="Prefix",
                                 backend=client.V1IngressBackend(
                                     service=client.V1IngressServiceBackend(
-                                        name=name,
+                                        name=service_name,
                                         port=client.V1ServiceBackendPort(number=80)
                                     )
                                 )
@@ -356,17 +395,92 @@ def create_deployment(name: str, image: str, source: str = "image", port: int = 
             ]
         )
     )
-    networking_v1.create_namespaced_ingress(namespace=namespace, body=ingress_body)
+    try:
+        networking_v1.create_namespaced_ingress(namespace=namespace, body=body)
+    except client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+        networking_v1.replace_namespaced_ingress(name=project, namespace=namespace, body=body)
 
-    record_ownership(name, username, source, image)
-    log_history(name, source, "created", image)
+
+def deploy_component(project, name, image, port=DEFAULT_PORT, service_name=None,
+                     expose=True, source="image", username="unknown"):
+    validate_name(project)
+    validate_name(name)
+
+    namespace = project_namespace(project)
+    service_name = service_name or name
+    validate_name(service_name)
+
+    ensure_namespace(namespace)
+    apply_deployment(namespace, name, image, port)
+    apply_service(namespace, service_name, name, port)
+    if expose:
+        apply_ingress(namespace, project, service_name)
+
+    record_ownership(project, username, source, image)
+    log_history(project, source, "created", f"{name} <- {image} (:{port})")
 
     return {
+        "project": project,
         "namespace": namespace,
-        "deployment": name,
+        "component": name,
+        "service": service_name,
+        "port": port,
+        "exposed": expose,
         "status": "created",
-        "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:{PUBLIC_PORT}"
+        "url": project_url(project) if expose else None,
     }
+
+
+@app.post("/deployments")
+def create_deployment(name: str, image: str, source: str = "image", port: int = DEFAULT_PORT,
+                      username: str = Depends(get_current_user)):
+    """이미지 하나를 그대로 배포한다. 프로젝트 이름과 컴포넌트 이름이 같은 단일 구성."""
+    return deploy_component(
+        project=name, name=name, image=image, port=port,
+        service_name=name, expose=True, source=source, username=username
+    )
+
+
+@app.get("/projects/{project}")
+def get_project(project: str):
+    namespace = project_namespace(project)
+    try:
+        deployments = apps_v1.list_namespaced_deployment(namespace=namespace)
+    except client.exceptions.ApiException:
+        return {"error": "not found"}
+
+    services = v1.list_namespaced_service(namespace=namespace)
+    service_names = [s.metadata.name for s in services.items]
+
+    return {
+        "project": project,
+        "namespace": namespace,
+        "url": project_url(project),
+        "components": [
+            {
+                "name": d.metadata.name,
+                "ready_replicas": d.status.ready_replicas or 0,
+                "replicas": d.status.replicas or 0,
+                "image": d.spec.template.spec.containers[0].image,
+            }
+            for d in deployments.items
+        ],
+        "services": service_names,
+    }
+
+
+@app.delete("/projects/{project}")
+def delete_project(project: str, username: str = Depends(get_current_user)):
+    owner = get_owner(project)
+    if owner and owner != username:
+        raise HTTPException(status_code=403, detail="본인이 만든 프로젝트만 삭제할 수 있습니다")
+
+    v1.delete_namespace(name=project_namespace(project))
+    remove_ownership(project)
+    log_history(project, "project", "deleted")
+    return {"project": project, "status": "deleted"}
 
 
 @app.get("/deployments/{name}")
@@ -397,11 +511,30 @@ def delete_deployment(name: str, username: str = Depends(get_current_user)):
 
 
 @app.post("/deploy-from-repo")
-def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_current_user)):
+def deploy_from_repo(
+    name: str,
+    repo_url: str,
+    project: str = None,
+    service_name: str = None,
+    expose: bool = True,
+    username: str = Depends(get_current_user),
+):
+    """저장소를 빌드해 컴포넌트로 배포한다.
+
+    project를 생략하면 name과 같은 이름의 단일 컴포넌트 프로젝트가 된다.
+    같은 project로 여러 번 호출하면 한 네임스페이스에 컴포넌트가 쌓이고,
+    컴포넌트끼리는 service_name으로 서로를 호출할 수 있다.
+    """
     validate_name(name)
-    image = f"{DOCKER_HUB_USER}/{name}:latest"
-    build_job_name = f"kaniko-build-{name}"
-    configmap_name = f"dockerfile-{name}"
+    project = project or name
+    validate_name(project)
+    service_name = service_name or name
+    validate_name(service_name)
+
+    slug = component_slug(project, name)
+    image = f"{DOCKER_HUB_USER}/{slug}:latest"
+    build_job_name = f"kaniko-build-{slug}"
+    configmap_name = f"dockerfile-{slug}"
 
     owner, repo = parse_repo_url(repo_url)
     files = get_repo_files(owner, repo)
@@ -509,6 +642,10 @@ def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_curre
             annotations={
                 "nimbus.io/owner": username,
                 "nimbus.io/port": str(app_port),
+                "nimbus.io/project": project,
+                "nimbus.io/component": name,
+                "nimbus.io/service": service_name,
+                "nimbus.io/expose": str(expose).lower(),
             }
         ),
         spec=client.V1JobSpec(
@@ -519,13 +656,20 @@ def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_curre
     )
     batch_v1.create_namespaced_job(namespace="default", body=job_body)
 
-    return {"status": "building", "name": name, "port": app_port}
+    return {
+        "status": "building",
+        "project": project,
+        "name": name,
+        "service": service_name,
+        "port": app_port,
+        "exposed": expose,
+    }
 
 
 @app.get("/deploy-from-repo/{name}/status")
-def deploy_from_repo_status(name: str):
-    image = f"{DOCKER_HUB_USER}/{name}:latest"
-    build_job_name = f"kaniko-build-{name}"
+def deploy_from_repo_status(name: str, project: str = None):
+    project = project or name
+    build_job_name = f"kaniko-build-{component_slug(project, name)}"
 
     try:
         job = batch_v1.read_namespaced_job(name=build_job_name, namespace="default")
@@ -536,6 +680,12 @@ def deploy_from_repo_status(name: str):
     annotations = job.metadata.annotations or {}
     owner = annotations.get("nimbus.io/owner", "unknown")
     app_port = int(annotations.get("nimbus.io/port", DEFAULT_PORT))
+    project = annotations.get("nimbus.io/project", project)
+    component = annotations.get("nimbus.io/component", name)
+    service_name = annotations.get("nimbus.io/service", component)
+    expose = annotations.get("nimbus.io/expose", "true") == "true"
+
+    image = f"{DOCKER_HUB_USER}/{component_slug(project, component)}:latest"
 
     if job_status.failed:
         pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
@@ -548,24 +698,28 @@ def deploy_from_repo_status(name: str):
                     break
                 except client.exceptions.ApiException:
                     continue
-        log_history(name, "repo", "build_failed", logs[:300])
+        log_history(project, "repo", "build_failed", logs[:300])
         return {"status": "build failed", "logs": logs}
 
     if not job_status.succeeded:
         return {"status": "building"}
 
-    # 빌드 성공 -> 이미 배포됐는지 확인 후, 없으면 새로 배포
-    namespace = f"user-{name}"
+    # 빌드 성공 -> 이미 배포돼 있으면 그대로 두고, 없으면 배포한다
+    namespace = project_namespace(project)
     try:
-        apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+        apps_v1.read_namespaced_deployment(name=component, namespace=namespace)
         return {
+            "project": project,
             "namespace": namespace,
-            "deployment": name,
+            "component": component,
             "status": "created",
-            "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:{PUBLIC_PORT}"
+            "url": project_url(project) if expose else None,
         }
     except client.exceptions.ApiException:
-        return create_deployment(name=name, image=image, source="repo", port=app_port, username=owner)
+        return deploy_component(
+            project=project, name=component, image=image, port=app_port,
+            service_name=service_name, expose=expose, source="repo", username=owner
+        )
 
 
 @app.get("/history")
