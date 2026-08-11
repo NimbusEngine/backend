@@ -370,11 +370,20 @@ def apply_deployment(namespace, name, image, port, env_vars=None):
 
 
 def apply_service(namespace, service_name, app_label, port):
+    """Service를 80번과 실제 포트 두 곳으로 연다.
+
+    HTTP 컴포넌트는 보통 포트 없이 http://<service> 로 호출하므로 80번이 필요하고,
+    DB처럼 HTTP가 아닌 컴포넌트는 원래 포트(예: 5432)로 접속하므로 둘 다 열어둔다.
+    """
+    ports = [client.V1ServicePort(name="http", port=80, target_port=port)]
+    if port != 80:
+        ports.append(client.V1ServicePort(name="app", port=port, target_port=port))
+
     body = client.V1Service(
         metadata=client.V1ObjectMeta(name=service_name, namespace=namespace),
         spec=client.V1ServiceSpec(
             selector={"app": app_label},
-            ports=[client.V1ServicePort(port=80, target_port=port)]
+            ports=ports
         )
     )
     try:
