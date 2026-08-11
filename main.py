@@ -197,6 +197,48 @@ def get_repo_files(owner, repo):
     return [item["name"] for item in res.json()]
 
 
+DEFAULT_PORT = 80
+
+# Dockerfile을 자동 생성하는 경우, 프로젝트 종류별로 애플리케이션이 실제로 듣는 포트
+AUTO_PORTS = {
+    "node": 3000,      # npm start (Express 등 다수가 3000)
+    "django": 80,      # runserver 0.0.0.0:80 으로 고정해 생성
+    "python": 5000,    # Flask 기본 포트
+    "static": 80,      # nginx
+}
+
+
+def detect_project_type(files):
+    if "package.json" in files:
+        return "node"
+    if "requirements.txt" in files:
+        return "django" if "manage.py" in files else "python"
+    if "index.html" in files:
+        return "static"
+    return None
+
+
+def detect_port(owner, repo, files):
+    """배포할 컨테이너가 실제로 listen 하는 포트를 추정한다.
+
+    Dockerfile이 있으면 EXPOSE 값을 사용하고(멀티스테이지면 마지막 값),
+    없으면 자동 생성할 Dockerfile의 프로젝트 종류별 기본 포트를 사용한다.
+    """
+    if "Dockerfile" in files:
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/Dockerfile"
+        try:
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                exposed = re.findall(r"^\s*EXPOSE\s+(\d+)", res.text, re.MULTILINE | re.IGNORECASE)
+                if exposed:
+                    return int(exposed[-1])
+        except requests.RequestException:
+            pass
+        return DEFAULT_PORT
+
+    return AUTO_PORTS.get(detect_project_type(files), DEFAULT_PORT)
+
+
 def generate_dockerfile(files):
     if "package.json" in files:
         return (
@@ -204,16 +246,20 @@ def generate_dockerfile(files):
             "WORKDIR /app\n"
             "COPY . .\n"
             "RUN npm install\n"
+            f"ENV PORT={AUTO_PORTS['node']}\n"
+            f"EXPOSE {AUTO_PORTS['node']}\n"
             'CMD ["npm", "start"]\n'
         )
     if "requirements.txt" in files:
         if "manage.py" in files:
+            port = AUTO_PORTS["django"]
             return (
                 "FROM python:3.11-slim\n"
                 "WORKDIR /app\n"
                 "COPY . .\n"
                 "RUN pip install -r requirements.txt\n"
-                'CMD ["python", "manage.py", "runserver", "0.0.0.0:80"]\n'
+                f"EXPOSE {port}\n"
+                f'CMD ["python", "manage.py", "runserver", "0.0.0.0:{port}"]\n'
             )
         entry = "app.py" if "app.py" in files else "main.py"
         return (
@@ -221,12 +267,14 @@ def generate_dockerfile(files):
             "WORKDIR /app\n"
             "COPY . .\n"
             "RUN pip install -r requirements.txt\n"
+            f"EXPOSE {AUTO_PORTS['python']}\n"
             f'CMD ["python", "{entry}"]\n'
         )
     if "index.html" in files:
         return (
             "FROM nginx:alpine\n"
             "COPY . /usr/share/nginx/html\n"
+            f"EXPOSE {AUTO_PORTS['static']}\n"
         )
     return None
 
@@ -237,7 +285,7 @@ def health_check():
 
 
 @app.post("/deployments")
-def create_deployment(name: str, image: str, source: str = "image", username: str = Depends(get_current_user)):
+def create_deployment(name: str, image: str, source: str = "image", port: int = DEFAULT_PORT, username: str = Depends(get_current_user)):
     validate_name(name)
     namespace = f"user-{name}"
 
@@ -251,7 +299,7 @@ def create_deployment(name: str, image: str, source: str = "image", username: st
     container = client.V1Container(
         name=name,
         image=image,
-        ports=[client.V1ContainerPort(container_port=80)]
+        ports=[client.V1ContainerPort(container_port=port)]
     )
     template = client.V1PodTemplateSpec(
         metadata=client.V1ObjectMeta(labels={"app": name}),
@@ -273,7 +321,7 @@ def create_deployment(name: str, image: str, source: str = "image", username: st
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
         spec=client.V1ServiceSpec(
             selector={"app": name},
-            ports=[client.V1ServicePort(port=80, target_port=80)]
+            ports=[client.V1ServicePort(port=80, target_port=port)]
         )
     )
     v1.create_namespaced_service(namespace=namespace, body=service_body)
@@ -358,6 +406,9 @@ def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_curre
     owner, repo = parse_repo_url(repo_url)
     files = get_repo_files(owner, repo)
     has_dockerfile = "Dockerfile" in files
+
+    # 배포 단계에서 다시 조회하지 않도록, 빌드 Job 어노테이션에 포트를 남겨둔다
+    app_port = detect_port(owner, repo, files)
 
     # 기존에 같은 이름의 빌드 Job/ConfigMap이 있으면 먼저 정리
     try:
@@ -455,7 +506,10 @@ def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_curre
         metadata=client.V1ObjectMeta(
             name=build_job_name,
             namespace="default",
-            annotations={"nimbus.io/owner": username}
+            annotations={
+                "nimbus.io/owner": username,
+                "nimbus.io/port": str(app_port),
+            }
         ),
         spec=client.V1JobSpec(
             template=client.V1PodTemplateSpec(spec=pod_spec),
@@ -465,7 +519,7 @@ def deploy_from_repo(name: str, repo_url: str, username: str = Depends(get_curre
     )
     batch_v1.create_namespaced_job(namespace="default", body=job_body)
 
-    return {"status": "building", "name": name}
+    return {"status": "building", "name": name, "port": app_port}
 
 
 @app.get("/deploy-from-repo/{name}/status")
@@ -479,7 +533,9 @@ def deploy_from_repo_status(name: str):
         return {"status": "not found"}
 
     job_status = job.status
-    owner = (job.metadata.annotations or {}).get("nimbus.io/owner", "unknown")
+    annotations = job.metadata.annotations or {}
+    owner = annotations.get("nimbus.io/owner", "unknown")
+    app_port = int(annotations.get("nimbus.io/port", DEFAULT_PORT))
 
     if job_status.failed:
         pods = v1.list_namespaced_pod(namespace="default", label_selector=f"job-name={build_job_name}")
@@ -509,7 +565,7 @@ def deploy_from_repo_status(name: str):
             "url": f"http://{name}.{PUBLIC_HOST}.sslip.io:{PUBLIC_PORT}"
         }
     except client.exceptions.ApiException:
-        return create_deployment(name=name, image=image, source="repo", username=owner)
+        return create_deployment(name=name, image=image, source="repo", port=app_port, username=owner)
 
 
 @app.get("/history")
